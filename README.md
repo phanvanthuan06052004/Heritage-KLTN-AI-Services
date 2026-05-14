@@ -1,0 +1,325 @@
+# Heritage AI Services
+
+> **Dịch vụ AI Knowledge Base** dành cho hệ thống Heritage — cung cấp import tài liệu, semantic search, và wiki tri thức di sản văn hóa.
+>
+
+
+---
+
+## Tổng quan kiến trúc
+
+```
++------------------+    REST API     +-------------------------+
+|  Heritage FE     | <-------------- |  Heritage-LastDance-BE  |
+|  (Next.js/React) |  GET /heritage  |  (NestJS, port 3000)    |
++------------------+                 +-------------------------+
+                                              |
+                            Authorization: Bearer <HERITAGE_SERVICE_TOKEN>
+                                              |
+                                              v
+                                +---------------------------+
+                                |  Heritage AI Services     |
+                                |  (FastAPI, port 5055)     |
+                                |                           |
+                                |  POST /api/heritage/import|
+                                |  GET  /api/heritage/search|
+                                |  GET  /api/heritage/wiki  |
+                                |  GET  /mcp  (MCP server)  |
+                                +---------------------------+
+                                     |          |          |
+                              PostgreSQL      Redis      MinIO
+                              (pgvector)    (workers)  (files)
+```
+
+### Luồng hoạt động
+
+1. **Import tài liệu**: FE upload file → NestJS BE → POST `/api/heritage/import` → AI Services enqueue job → Worker xử lý (chunk + embed) → Wiki page được tạo
+2. **Query**: FE gửi query → NestJS BE → GET `/api/heritage/search?q=...` → AI Services tìm kiếm → trả kết quả về FE
+
+---
+
+## Các endpoint Heritage Bridge
+
+| Method | Endpoint | Mô tả |
+|--------|----------|-------|
+| `POST` | `/api/heritage/import` | Upload file hoặc URL để ingest vào knowledge base |
+| `GET` | `/api/heritage/search?q=...` | Tìm kiếm semantic trên wiki pages |
+| `GET` | `/api/heritage/wiki` | Lấy danh sách tất cả wiki pages |
+| `GET` | `/api/heritage/wiki/{slug}` | Lấy chi tiết một wiki page |
+| `GET` | `/api/heritage/sources/{id}/progress` | Kiểm tra tiến trình ingestion |
+
+> **Tất cả endpoint trên đều yêu cầu header**: `Authorization: Bearer <HERITAGE_SERVICE_TOKEN>`
+
+---
+
+## Yêu cầu hệ thống
+
+- Python >= 3.11
+- PostgreSQL >= 16 với pgvector extension
+- Redis >= 7
+- MinIO (hoặc S3-compatible storage)
+- `uv` hoặc `pip` để quản lý Python packages
+
+---
+
+## Cài đặt & Chạy (Local Development)
+
+### Bước 1: Clone và setup môi trường
+
+```bash
+cd Heritage-KLTN-AI-Services
+
+# Copy file env
+cp .env.example .env
+
+# Chỉnh sửa .env (xem phần Biến môi trường bên dưới)
+# Đặc biệt quan trọng: HERITAGE_SERVICE_TOKEN
+```
+
+### Bước 2: Tạo Python virtual environment
+
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Linux/Mac
+# Windows: .venv\Scripts\activate
+```
+
+### Bước 3: Cài dependencies
+
+```bash
+pip install -e ".[dev]"
+# Hoặc dùng uv (khuyến nghị):
+pip install uv && uv sync
+```
+
+### Bước 4: Khởi động infrastructure (PostgreSQL + Redis + MinIO)
+
+**Option A: Docker Compose (khuyến nghị)**
+```bash
+# Copy và chỉnh docker env
+cp .env.docker.example .env.docker
+# Edit .env.docker
+
+docker compose up -d postgres redis minio
+```
+
+**Option B: Cài đặt thủ công**
+- PostgreSQL với pgvector: https://github.com/pgvector/pgvector#installation
+- Redis: `sudo apt install redis-server`
+- MinIO: https://min.io/docs/minio/linux/index.html
+
+### Bước 5: Chạy database migrations
+
+```bash
+# Đảm bảo DATABASE_URL trong .env trỏ đúng database
+alembic upgrade head
+```
+
+### Bước 6: Chạy API server
+
+```bash
+# Terminal 1: API server
+uvicorn app.main:app --host 0.0.0.0 --port 5055 --reload
+
+# Terminal 2: Ingestion worker (xử lý file upload)
+python -m arq app.worker.WorkerSettings
+
+# Terminal 3: Skills worker (optional)
+python -m arq app.worker.SkillWorkerSettings
+```
+
+### Bước 7: Verify
+
+```bash
+# Health check
+curl http://localhost:5055/health
+
+# Root info
+curl http://localhost:5055/
+
+# Swagger UI
+open http://localhost:5055/docs
+```
+
+---
+
+## Chạy với Docker Compose (Full Stack)
+
+```bash
+# Setup env
+cp .env.docker.example .env.docker
+# Chỉnh sửa .env.docker (đặc biệt SECRET_KEY và HERITAGE_SERVICE_TOKEN)
+
+# Build và chạy tất cả services
+docker compose up -d
+
+# Kiểm tra logs
+docker compose logs -f api
+docker compose logs -f worker
+
+# Kiểm tra health
+curl http://localhost:5055/health
+```
+
+**Ports sau khi chạy:**
+| Service | Port | Mô tả |
+|---------|------|-------|
+| API (FastAPI) | `5055` | Heritage AI Services REST API + MCP |
+| Portal UI | `3119` | Heritage AI admin portal (quản lý wiki, nguồn tài liệu) |
+| PostgreSQL | `5433` | Database (port 5433 để tránh conflict) |
+| Redis | `6380` | Job queue (port 6380 để tránh conflict) |
+| MinIO API | `9002` | Object storage |
+| MinIO Console | `9003` | MinIO web UI |
+
+---
+
+## Biến môi trường quan trọng
+
+| Biến | Mô tả | Ví dụ |
+|------|-------|-------|
+| `DATABASE_URL` | PostgreSQL connection string (cần pgvector) | `postgresql+asyncpg://user:pass@host:5432/db` |
+| `SECRET_KEY` | JWT secret (internal portal auth) | `openssl rand -hex 64` |
+| `HERITAGE_SERVICE_TOKEN` | **Token chia sẻ với NestJS BE** | `openssl rand -hex 32` |
+| `MINIO_ENDPOINT` | MinIO endpoint | `localhost:9002` |
+| `REDIS_HOST` | Redis host | `localhost` |
+| `CORS_ORIGINS` | Allowed CORS origins | `http://localhost:3000` |
+
+> ⚠️ **Quan trọng**: `HERITAGE_SERVICE_TOKEN` phải được thêm vào `.env` của `Heritage-LastDance-BE` dưới tên `AI_SERVICE_TOKEN` (hoặc tên tương đương).
+
+---
+
+## Tích hợp với Heritage-LastDance-BE (NestJS)
+
+Thêm vào file `.env` của `Heritage-LastDance-BE`:
+
+```env
+# AI Services
+AI_SERVICE_URL=http://localhost:5055
+AI_SERVICE_TOKEN=c67e8515cf7d16063d33bab2275fc7f261f885ebcfb4a1dff2ca9989c73d4c0f
+```
+
+### Ví dụ gọi API từ NestJS
+
+```typescript
+// services/ai-knowledge.service.ts
+import { Injectable, HttpService } from '@nestjs/common';
+
+@Injectable()
+export class AiKnowledgeService {
+  private readonly baseUrl = process.env.AI_SERVICE_URL;
+  private readonly token = process.env.AI_SERVICE_TOKEN;
+
+  private get headers() {
+    return { Authorization: `Bearer ${this.token}` };
+  }
+
+  // Import file vào knowledge base
+  async importDocument(file: Express.Multer.File, title?: string) {
+    const form = new FormData();
+    form.append('file', new Blob([file.buffer]), file.originalname);
+    if (title) form.append('title', title);
+
+    const res = await fetch(`${this.baseUrl}/api/heritage/import`, {
+      method: 'POST',
+      headers: this.headers,
+      body: form,
+    });
+    return res.json();
+  }
+
+  // Search knowledge base
+  async search(query: string, limit = 10) {
+    const res = await fetch(
+      `${this.baseUrl}/api/heritage/search?q=${encodeURIComponent(query)}&limit=${limit}`,
+      { headers: this.headers },
+    );
+    return res.json();
+  }
+
+  // Kiểm tra tiến trình ingestion
+  async getProgress(sourceId: string) {
+    const res = await fetch(
+      `${this.baseUrl}/api/heritage/sources/${sourceId}/progress`,
+      { headers: this.headers },
+    );
+    return res.json();
+  }
+}
+```
+
+---
+
+## Cấu hình AI Provider (LLM + Embedding)
+
+Sau khi khởi động lần đầu, truy cập **Heritage AI Admin Portal** tại `http://localhost:3119`:
+
+1. Đăng nhập với `admin@heritage-ai.local` / `Heritage@Admin2024!`
+2. Vào **Settings > AI Configuration**
+3. Cấu hình:
+   - **Embedding model**: Google Gemini `text-embedding-004` (khuyến nghị) hoặc OpenAI `text-embedding-3-small`
+   - **LLM model**: Google Gemini `gemini-2.0-flash` hoặc OpenAI `gpt-4o-mini`
+   - **Vision model** (nếu cần xử lý ảnh trong PDF): Gemini Vision
+4. Lưu và test kết nối
+
+---
+
+## Cấu trúc thư mục
+
+```
+Heritage-KLTN-AI-Services/
+├── app/
+│   ├── main.py              # FastAPI entry point (đã cập nhật cho Heritage)
+│   ├── config.py            # Settings (đã thêm HERITAGE_SERVICE_TOKEN)
+│   ├── routers/
+│   │   ├── heritage_bridge.py  # ← ROUTER MỚI: endpoints cho NestJS BE
+│   │   ├── sources.py       # Source management
+│   │   ├── wiki.py          # Wiki pages CRUD
+│   │   └── ...              # Other service routers
+│   ├── database/
+│   │   ├── models.py        # SQLAlchemy models
+│   │   └── __init__.py
+│   ├── services/
+│   │   ├── wiki_service.py  # Wiki logic
+│   │   ├── kb_service.py    # Knowledge base / ingestion
+│   │   └── storage_service.py # MinIO
+│   ├── ai/                  # AI provider registry
+│   ├── mcp/                 # MCP server (Claude integration)
+│   └── worker.py            # Arq worker tasks
+├── alembic/                 # DB migrations
+├── frontend/                # Heritage AI portal UI (Next.js)
+├── docker-compose.yml       # Heritage-customized compose
+├── .env                     # Local dev env (gitignored)
+├── .env.example             # Template
+├── .env.docker.example      # Docker template
+└── README.md                # This file
+```
+
+---
+
+## Troubleshooting
+
+### Lỗi "pgvector extension not found"
+```sql
+-- Kết nối vào PostgreSQL và chạy:
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+Hoặc dùng image `pgvector/pgvector:pg16` trong Docker (đã có sẵn trong docker-compose).
+
+### Lỗi "HERITAGE_SERVICE_TOKEN is not configured"
+Kiểm tra `.env` có chứa `HERITAGE_SERVICE_TOKEN=...` và không để trống.
+
+### Worker không nhận job
+Kiểm tra Redis kết nối được không:
+```bash
+redis-cli -h localhost -p 6379 ping
+# Nếu dùng Docker: redis-cli -h localhost -p 6380 ping
+```
+
+### MinIO bucket not found
+```bash
+curl http://localhost:5055/health
+# Nếu minio: error, kiểm tra MINIO_ENDPOINT và credentials
+```
+
+---
+

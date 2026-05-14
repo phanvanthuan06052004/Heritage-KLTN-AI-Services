@@ -1,0 +1,151 @@
+
+# Heritage AI Services — Docker Compose
+# Heritage AI Services document ingestion engine. Provides document ingestion + semantic search for Heritage-LastDance-BE.
+#
+# Usage:
+#   cp .env.docker.example .env.docker
+#   # Edit .env.docker with your settings
+#   docker compose up -d
+#
+# Services:
+#   postgres  - PostgreSQL 16 with pgvector extension (port 5433, avoids conflict with Heritage-LastDance-BE)
+#   redis     - Redis 7 (port 6380, avoids conflict)
+#   minio     - MinIO object storage (port 9000, 9001)
+#   api       - Heritage AI Services FastAPI (port 5055)
+#   worker    - Ingestion worker (arq)
+#   worker_skills - Skills worker (arq)
+#   frontend  - Heritage AI portal UI (port 3119)
+
+# Backend image built once, reused by api + workers
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: heritage-ai-services:latest
+  env_file: [.env.docker]
+  restart: always
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+  volumes:
+    - ./temp_uploads:/app/temp_uploads
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  # Infrastructure
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: heritage_ai_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - heritage_postgres_data:/var/lib/postgresql/data
+    ports:
+      # Use 5433 to avoid conflict with Heritage-LastDance-BE MySQL (which uses 3306)
+      # or another PostgreSQL instance that may be running on 5432
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: heritage_ai_redis
+    restart: always
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - heritage_redis_data:/data
+    ports:
+      # Use 6380 to avoid conflict with other Redis instances
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    container_name: heritage_ai_minio
+    restart: always
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    volumes:
+      - heritage_minio_data:/data
+    ports:
+      - "9002:9000"
+      - "9003:9001"
+
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Application
+
+  api:
+    <<: *backend
+    container_name: heritage_ai_api
+    ports:
+      - "5055:5055"
+    command: python -m uvicorn app.main:app --host 0.0.0.0 --port 5055
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:5055/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  worker:
+    <<: *backend
+    container_name: heritage_ai_worker
+    command: python -m arq app.worker.WorkerSettings
+    depends_on:
+      api:
+        condition: service_healthy
+
+  worker_skills:
+    <<: *backend
+    container_name: heritage_ai_worker_skills
+    command: python -m arq app.worker.SkillWorkerSettings
+    depends_on:
+      api:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:5055}
+    image: heritage-ai-frontend:latest
+    container_name: heritage_ai_frontend
+    restart: always
+    ports:
+      - "3119:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:5055}
+      - INTERNAL_API_URL=http://api:5055
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  heritage_postgres_data:
+  heritage_redis_data:
+  heritage_minio_data:

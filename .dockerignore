@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Git
+.git/
+.gitignore
+
+# Env / secrets
+.env*
+!.env.example
+
+# Frontend (built separately)
+frontend/
+
+# Dev tooling
+.claude/
+.ruff_cache/
+*.md
+docs/
+

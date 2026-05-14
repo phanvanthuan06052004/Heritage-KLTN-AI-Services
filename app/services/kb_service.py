@@ -1,0 +1,277 @@
+"""
+Knowledge Base service — document ingestion via the LLM Wiki pipeline.
+
+Pipeline: Upload → Extract text → Extract & caption images → Build outline →
+Compile into wiki (LLM). No chunking, no per-chunk embeddings — embeddings now
+live on WikiPage rows. Search is handled by app/services/wiki_service.py.
+
+Provider-agnostic: uses ProviderRegistry to resolve embedding/LLM/vision
+providers from app_config at runtime.
+"""
+
+import uuid
+from typing import Optional
+
+from loguru import logger
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.ai.registry import ProviderRegistry
+from app.ai.wiki_compiler import compile_source_into_wiki
+from app.database.models import KnowledgeType, Source, SourceImage
+from app.services.image_service import ImageInfo, extract_images
+from app.services.source_outline import assemble_full_text, build_outline
+from app.services.storage_service import storage_service
+
+# ---------------------------------------------------------------------------
+# Ingestion pipeline
+# ---------------------------------------------------------------------------
+
+async def ingest_source(
+    session: AsyncSession,
+    source_id: uuid.UUID,
+    file_data: Optional[bytes] = None,
+    file_name: Optional[str] = None,
+) -> Source:
+    """
+    Ingest a Source into the wiki:
+      1. Upload original file to MinIO (if file)
+      2. Extract text per page
+      3. Extract images, caption with vision provider, inline captions
+      4. Build heading-based outline → Source.outline_json
+      5. Compile into wiki via LLM (creates/updates WikiPage rows)
+    """
+    source = await session.get(Source, source_id)
+    if not source:
+        raise ValueError(f"Source {source_id} not found")
+
+    try:
+        registry = ProviderRegistry(session)
+        vision_provider = await registry.get_vision()
+
+        source.status = "processing"
+        await session.flush()
+
+        # --- Step 1: Upload original file ---
+        if file_data and file_name:
+            minio_key = f"sources/{source_id}/original/{file_name}"
+            storage_service.upload_file(
+                object_name=minio_key,
+                data=file_data,
+                content_type=_guess_content_type(file_name),
+            )
+            source.minio_key = minio_key
+            source.file_name = file_name
+            source.file_size = len(file_data)
+
+        # --- Step 2: Extract text per page ---
+        if file_data and file_name:
+            pages_data = await _extract_text_from_file(file_data, file_name)
+        elif source.url:
+            pages_data = await _extract_text_from_url(source.url)
+        else:
+            pages_data = []
+
+        if not pages_data or not any((p.get("content") or "").strip() for p in pages_data):
+            source.status = "error"
+            source.error_message = "Could not extract text content from source"
+            await session.flush()
+            return source
+
+        # --- Step 3: Extract & caption images, persist, inline markers ---
+        images: list[ImageInfo] = []
+        if file_data and file_name:
+            images = extract_images(file_data, file_name, str(source_id))
+            if vision_provider and images:
+                for idx, img in enumerate(images, 1):
+                    try:
+                        if idx % 5 == 0 or idx == 1 or idx == len(images):
+                            logger.info(f"Vision AI analyzing image {idx}/{len(images)}...")
+                        img_bytes = storage_service.download_file(img.minio_key)
+                        img.caption = await vision_provider.analyze_image(
+                            img_bytes, img.content_type
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to analyze image {img.minio_key}: {e}")
+
+            # Persist source_images rows so wiki content_md can reference by uuid.
+            for img in images:
+                row = SourceImage(
+                    source_id=source_id,
+                    minio_key=img.minio_key,
+                    page_number=img.page_number,
+                    image_index=img.image_index,
+                    caption=img.caption,
+                    content_type=img.content_type,
+                    size_bytes=img.size_bytes,
+                )
+                session.add(row)
+                await session.flush()  # populate row.id
+                img.image_id = str(row.id)
+
+        _inline_image_markers(pages_data, images)
+
+        # --- Step 4: Build outline + assemble full_text ---
+        source.outline_json = build_outline(pages_data)
+        full_text, page_offsets = assemble_full_text(pages_data)
+        source.full_text = full_text
+        source.page_offsets = page_offsets
+
+        # --- Step 5: Resolve KnowledgeType context ---
+        kt_slug = kt_name = kt_desc = None
+        if source.knowledge_type_id:
+            kt = await session.get(KnowledgeType, source.knowledge_type_id)
+            if kt:
+                kt_slug = kt.slug
+                kt_name = kt.name
+                kt_desc = kt.description
+
+        # --- Step 6: Compile into wiki ---
+        result = await compile_source_into_wiki(
+            session=session,
+            source=source,
+            full_text=full_text,
+            knowledge_type_slug=kt_slug,
+            knowledge_type_name=kt_name,
+            knowledge_type_description=kt_desc,
+        )
+
+        source.status = "ready"
+        source.error_message = None
+        await session.flush()
+        logger.success(
+            f"Source {source_id} ingested into wiki: "
+            f"+{result['pages_created']} pages, ~{result['pages_updated']} updated"
+        )
+        return source
+
+    except Exception as e:
+        logger.error(f"Ingestion failed for source {source_id}: {e}")
+        source.status = "error"
+        source.error_message = str(e)[:500]
+        await session.flush()
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _guess_content_type(file_name: str) -> str:
+    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+    return {
+        "pdf": "application/pdf",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "doc": "application/msword",
+        "txt": "text/plain",
+        "md": "text/markdown",
+        "csv": "text/csv",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }.get(ext, "application/octet-stream")
+
+
+def _sanitize_caption_for_alt(caption: str) -> str:
+    """Make a caption safe to use inside markdown image alt text."""
+    # Strip newlines + characters that would break `![alt](url)` parsing.
+    cleaned = caption.replace("\n", " ").replace("\r", " ")
+    cleaned = cleaned.replace("[", "(").replace("]", ")")
+    return cleaned.strip()
+
+
+def _inline_image_markers(pages_data: list[dict], images: list[ImageInfo]) -> None:
+    """Inject markdown image markers into per-page text.
+
+    Each image becomes `![caption](image://<uuid>)` appended at the end of the
+    page it came from. The wiki compiler is instructed to preserve these
+    markers in the most contextually-relevant wiki page, drop irrelevant ones,
+    and never invent UUIDs. Mutates pages_data in place.
+    """
+    if not images:
+        return
+
+    by_page: dict[int, list[str]] = {}
+    for img in images:
+        if not img.image_id:
+            continue
+        alt = _sanitize_caption_for_alt(img.caption or "")
+        marker = f"![{alt}](image://{img.image_id})"
+        page_num = img.page_number or 1
+        by_page.setdefault(page_num, []).append(marker)
+
+    if not by_page:
+        return
+
+    for page in pages_data:
+        pnum = page.get("page_number") or 1
+        markers = by_page.get(pnum)
+        if not markers:
+            continue
+        joined = "\n\n".join(markers)
+        page["content"] = (page.get("content") or "") + f"\n\n{joined}\n"
+
+
+async def _extract_text_from_file(file_data: bytes, file_name: str) -> list[dict]:
+    """Extract text from a binary file, returning per-page records."""
+    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+    pages_data: list[dict] = []
+
+    if ext == "pdf":
+        import fitz
+        doc = fitz.open(stream=file_data, filetype="pdf")
+        for i, page in enumerate(doc):  # type: ignore[arg-type]
+            pages_data.append({"content": (page.get_text() or "").strip(), "page_number": i + 1})
+        doc.close()
+        return pages_data
+
+    if ext == "docx":
+        import io
+
+        import mammoth
+        try:
+            result = mammoth.extract_raw_text(io.BytesIO(file_data))
+            return [{"content": result.value or "", "page_number": 1}]
+        except Exception:
+            pass  # fall through to content_core
+
+    if ext in ("txt", "md", "csv"):
+        return [{"content": file_data.decode("utf-8", errors="ignore"), "page_number": 1}]
+
+    # Other formats (doc, xlsx, pptx, ...): write to a temp file and let
+    # content-core extract via file path. Passing raw bytes as "content"
+    # doesn't work for binary formats — content-core expects a string there.
+    import os
+    import tempfile
+
+    try:
+        from content_core.content.extraction import extract_content
+        suffix = f".{ext}" if ext else ""
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(file_data)
+            tmp_path = tmp.name
+        try:
+            result = await extract_content({
+                "file_path": tmp_path,
+                "output_format": "markdown",
+            })
+            return [{"content": result.content or "", "page_number": 1}]
+        finally:
+            os.unlink(tmp_path)
+    except Exception as e:
+        logger.warning(f"content-core extraction failed for .{ext}: {e}")
+        # Binary formats must not be decoded as UTF-8 — that produces garbage
+        # with null bytes that PostgreSQL rejects. Return empty so the caller
+        # can surface a clear "no text content" error instead of crashing.
+        return [{"content": "", "page_number": 1}]
+
+
+async def _extract_text_from_url(url: str) -> list[dict]:
+    """Extract text from a URL — markdown output preferred."""
+    try:
+        from content_core.content.extraction import extract_content
+        result = await extract_content({"url": url, "output_format": "markdown"})
+        return [{"content": result.content or "", "page_number": 1}]
+    except Exception as e:
+        logger.warning(f"URL extraction failed for {url}: {e}")
+        import httpx
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, follow_redirects=True, timeout=30)
+            return [{"content": resp.text, "page_number": 1}]
