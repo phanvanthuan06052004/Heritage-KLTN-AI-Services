@@ -19,22 +19,61 @@ Design Notes:
   - For production, consider rotating the token via the admin portal.
 """
 
+import re
 import uuid
 from typing import Optional
 
 from arq.connections import ArqRedis, create_pool
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    UploadFile,
+)
 from loguru import logger
 from pydantic import BaseModel
-from sqlalchemy import func, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
-from app.database.models import Source, ScopeType, SourceDepartment, WikiPage
+from app.database.models import ScopeType, Source, WikiPage
 from app.database.repository import Repository
 
 router = APIRouter(prefix="/heritage")
+
+_SEARCH_STOPWORDS = {
+    "anh",
+    "ban",
+    "bạn",
+    "cho",
+    "cua",
+    "của",
+    "duoc",
+    "được",
+    "em",
+    "gi",
+    "gì",
+    "hay",
+    "la",
+    "là",
+    "mot",
+    "một",
+    "nao",
+    "nào",
+    "noi",
+    "nói",
+    "the",
+    "thế",
+    "toi",
+    "tôi",
+    "ve",
+    "về",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -148,11 +187,30 @@ class WikiLink(BaseModel):
     title: str
 
 
+class QueryCitation(BaseModel):
+    sourceId: str
+    title: str
+    page: Optional[int] = None
+    snippet: str
+    evidenceType: str
+    score: Optional[float] = None
+
+
+class QueryRawSource(BaseModel):
+    sourceId: str
+    title: str
+    sourceType: str
+    fileName: Optional[str] = None
+    url: Optional[str] = None
+
+
 class QueryResponse(BaseModel):
     answer: str
     mode: str
     sources: list[QuerySource]
     wikiLinks: list[WikiLink]
+    citations: list[QueryCitation] = []
+    rawSources: list[QueryRawSource] = []
 
 
 # ---------------------------------------------------------------------------
@@ -209,25 +267,74 @@ async def _search_wiki_pages_full_text(
 ) -> list[SearchResultItem]:
     from app.services import wiki_service
 
-    like = f"%{query}%"
+    terms = _extract_search_terms(query)
+    if not terms:
+        return []
+
+    phrase = " ".join(terms)
+    conditions = []
+    for term in terms:
+        like = f"%{term}%"
+        conditions.append(WikiPage.title.ilike(like))
+        conditions.append(WikiPage.summary.ilike(like))
+        conditions.append(WikiPage.content_md.ilike(like))
+
     stmt = (
         select(WikiPage)
         .where(
             WikiPage.slug.notin_([wiki_service.INDEX_SLUG, wiki_service.LOG_SLUG]),
             WikiPage.scope_type == "global",
-            or_(
-                WikiPage.title.ilike(like),
-                WikiPage.summary.ilike(like),
-            ),
+            or_(*conditions),
         )
         .order_by(WikiPage.updated_at.desc())
-        .limit(limit)
+        .limit(max(limit * 6, 20))
     )
     if page_type:
         stmt = stmt.where(WikiPage.page_type == page_type)
 
     pages = (await db.execute(stmt)).scalars().all()
-    return [_page_to_search_item(page, retrieval_mode="full_text") for page in pages]
+    ranked_pages = sorted(
+        pages,
+        key=lambda page: _score_full_text_page(page, terms, phrase),
+        reverse=True,
+    )
+    return [_page_to_search_item(page, retrieval_mode="full_text") for page in ranked_pages[:limit]]
+
+
+def _extract_search_terms(query: str) -> list[str]:
+    raw_terms = re.findall(r"[\wÀ-ỹ]+", query.lower())
+    terms: list[str] = []
+    for term in raw_terms:
+        if term in _SEARCH_STOPWORDS:
+            continue
+        if len(term) < 3 and term != "ai":
+            continue
+        if term not in terms:
+            terms.append(term)
+    return terms[:8]
+
+
+def _score_full_text_page(page: WikiPage, terms: list[str], phrase: str) -> float:
+    title = (page.title or "").lower()
+    summary = (page.summary or "").lower()
+    content = (page.content_md or "").lower()
+
+    score = 0.0
+    if phrase:
+        if phrase in title:
+            score += 24
+        if phrase in summary:
+            score += 12
+        if phrase in content:
+            score += 6
+    for term in terms:
+        if term in title:
+            score += 8
+        if term in summary:
+            score += 4
+        if term in content:
+            score += 1
+    return score
 
 
 def _page_to_search_item(
@@ -265,6 +372,7 @@ async def _generate_grounded_answer(
     question: str,
     pages: list[WikiPage],
     heritage_context: Optional[str] = None,
+    evidence_context: Optional[str] = None,
 ) -> str:
     from app.ai.registry import ProviderRegistry
 
@@ -280,26 +388,31 @@ async def _generate_grounded_answer(
 
     system = (
         "Bạn là Heritage Assistant. Trả lời bằng ngôn ngữ tự nhiên cùng ngôn ngữ với câu hỏi của người dùng. "
-        "Chỉ dùng thông tin trong CONTEXT. Nếu context không đủ, nói rõ là kho tri thức chưa đủ dữ liệu. "
-        "Không bịa nguồn, không nhắc đến prompt nội bộ, không chép nguyên văn dài. "
-        "Ưu tiên câu trả lời gọn, rõ, có cấu trúc nhẹ khi cần."
+        "Chỉ dùng thông tin trong phần ngữ cảnh wiki và phần trích dẫn tài liệu gốc được cung cấp. "
+        "Nếu context không đủ, nói rõ là kho tri thức chưa đủ dữ liệu. "
+        "Ưu tiên trích dẫn tài liệu gốc cho ngày tháng, tên riêng, số liệu và các chi tiết cần kiểm chứng. "
+        "Không bịa nguồn, không nhắc đến prompt nội bộ, không dùng các nhãn như WIKI CONTEXT, RAW EVIDENCE, [E1], (E1) hay E1/E2 trong câu trả lời. "
+        "Chỉ dùng tiếng Việt, không chèn ký tự Hán/Hàn/Nhật. "
+        "Không chép nguyên văn dài. Trả lời súc tích: tối đa 5 ý chính, chỉ dùng heading khi câu hỏi cần giải thích dài."
     )
     prompt_parts = [
         f"Câu hỏi của người dùng:\n{question}",
-        f"CONTEXT:\n\n{chr(10).join(context_blocks)}",
+        f"Ngữ cảnh wiki:\n\n{chr(10).join(context_blocks)}",
     ]
     if heritage_context:
         prompt_parts.insert(1, f"Ngữ cảnh di tích/trang hiện tại:\n{heritage_context}")
+    if evidence_context:
+        prompt_parts.append(f"Trích dẫn tài liệu gốc:\n\n{evidence_context}")
 
     registry = ProviderRegistry(db)
     llm = await registry.get_llm()
     answer = await llm.generate(
         "\n\n".join(prompt_parts),
         system=system,
-        max_tokens=900,
+        max_tokens=1400,
         temperature=0.2,
     )
-    return answer.strip() or (
+    return _sanitize_public_answer(answer) or (
         "Em chưa thể tổng hợp câu trả lời từ các nguồn hiện có. Anh thử hỏi cụ thể hơn hoặc import thêm tài liệu nhé."
     )
 
@@ -309,6 +422,49 @@ def _truncate_text(text: str, max_length: int) -> str:
     if len(normalized) <= max_length:
         return normalized
     return f"{normalized[:max_length].rstrip()}..."
+
+
+def _sanitize_public_answer(text: str) -> str:
+    cleaned = (text or "").strip()
+    cleaned = re.sub(r"\bWIKI\s*CONTEXT\b", "kho tri thức", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bRAW\s*EVIDENCE\b", "tài liệu gốc", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"【E\d+】", "", cleaned)
+    cleaned = re.sub(r"\[E\d+]", "", cleaned)
+    cleaned = re.sub(r"\(E\d+\)", "", cleaned)
+    cleaned = re.sub(r"\bE\d+\s*[-–:]", "", cleaned)
+    cleaned = re.sub(r"[\u4e00-\u9fff\u3400-\u4dbf\uac00-\ud7af\uFFFD]", "", cleaned)
+    return cleaned.strip()
+
+
+def _compose_grounded_fallback_answer(
+    question: str,
+    pages: list[WikiPage],
+    citations: list[dict],
+) -> str:
+    sections = []
+    for page in pages[:3]:
+        excerpt = _truncate_text(page.content_md or page.summary or "", 700)
+        if excerpt:
+            sections.append(f"### {page.title}\n{excerpt}\n\nNguồn wiki: {page.slug}")
+
+    evidence_sections = []
+    for citation in citations[:3]:
+        page_label = f", trang {citation.get('page')}" if citation.get("page") else ""
+        evidence_sections.append(
+            f"- {citation.get('title', 'Nguồn tài liệu')}{page_label}: "
+            f"{_truncate_text(citation.get('snippet', ''), 360)}"
+        )
+
+    parts = [
+        f"Em tìm được thông tin liên quan cho câu hỏi: \"{question}\".",
+        "",
+        "Hiện LLM tổng hợp đang tạm lỗi, nên em hiển thị phần nội dung liên quan nhất từ kho tri thức:",
+        "",
+        "\n\n".join(sections) if sections else "Chưa đọc được nội dung wiki chi tiết.",
+    ]
+    if evidence_sections:
+        parts.extend(["", "Tài liệu gốc liên quan:", "\n".join(evidence_sections)])
+    return "\n".join(parts).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +644,8 @@ async def heritage_query(
             mode=f"llm_9router:{retrieval_mode}:no_sources",
             sources=[],
             wikiLinks=[],
+            citations=[],
+            rawSources=[],
         )
 
     from app.services import wiki_service
@@ -509,20 +667,46 @@ async def heritage_query(
             mode=f"llm_9router:{retrieval_mode}:missing_details",
             sources=_to_query_sources(search_results),
             wikiLinks=[WikiLink(slug=s.slug, title=s.title) for s in search_results],
+            citations=[],
+            rawSources=[],
         )
 
-    answer = await _generate_grounded_answer(
-        db=db,
-        question=question,
-        pages=detail_pages,
-        heritage_context=body.heritageContext,
+    from app.services.source_chunk_service import (
+        evidence_to_citations,
+        evidence_to_context,
+        find_evidence,
+        list_raw_sources,
     )
+
+    source_ids: list[uuid.UUID] = []
+    for page in detail_pages:
+        source_ids.extend(page.source_ids or [])
+    source_ids = list(dict.fromkeys(source_ids))
+    evidence_hits = await find_evidence(db, search_query, source_ids, limit=5)
+    raw_sources = await list_raw_sources(db, source_ids)
+
+    citations = evidence_to_citations(evidence_hits)
+    mode = f"llm_9router:{retrieval_mode}"
+    try:
+        answer = await _generate_grounded_answer(
+            db=db,
+            question=question,
+            pages=detail_pages,
+            heritage_context=body.heritageContext,
+            evidence_context=evidence_to_context(evidence_hits),
+        )
+    except Exception as exc:
+        logger.warning(f"[Heritage] LLM answer generation failed, using fallback: {exc}")
+        answer = _compose_grounded_fallback_answer(question, detail_pages, citations)
+        mode = f"{mode}:fallback"
 
     return QueryResponse(
         answer=answer,
-        mode=f"llm_9router:{retrieval_mode}",
+        mode=mode,
         sources=_to_query_sources(search_results),
         wikiLinks=[WikiLink(slug=s.slug, title=s.title) for s in search_results],
+        citations=[QueryCitation(**item) for item in citations],
+        rawSources=[QueryRawSource(**item) for item in raw_sources],
     )
 
 

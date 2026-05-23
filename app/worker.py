@@ -83,6 +83,7 @@ async def ingest_file_task(ctx: dict, source_id: str):
         _extract_text_from_file,
         _inline_image_markers,
     )
+    from app.services.source_chunk_service import rebuild_source_chunks
     from app.services.source_outline import assemble_full_text, build_outline
     from app.services.storage_service import storage_service
 
@@ -184,6 +185,10 @@ async def ingest_file_task(ctx: dict, source_id: str):
             source.page_offsets = page_offsets
             await session.commit()
             await tracker.update(50, f"Outline: {len(source.outline_json or [])} top-level sections")
+            await tracker.update(52, "Building raw evidence chunks...")
+            await rebuild_source_chunks(session, source)
+            await session.commit()
+            await tracker.update(54, "Raw evidence chunks ready")
 
             # --- Step 5: Resolve KnowledgeType context (52%) ---
             kt_slug = kt_name = kt_desc = None
@@ -263,6 +268,7 @@ async def ingest_url_task(ctx: dict, source_id: str):
     from app.database import async_session_factory
     from app.database.models import KnowledgeType, Source
     from app.services.kb_service import _extract_text_from_url
+    from app.services.source_chunk_service import rebuild_source_chunks
     from app.services.source_outline import assemble_full_text, build_outline
 
     sid = uuid.UUID(source_id)
@@ -297,6 +303,9 @@ async def ingest_url_task(ctx: dict, source_id: str):
             full_text, page_offsets = assemble_full_text(pages_data)
             source.full_text = full_text
             source.page_offsets = page_offsets
+            await session.commit()
+            await tracker.update(50, "Building raw evidence chunks...")
+            await rebuild_source_chunks(session, source)
             await session.commit()
 
             kt_slug = kt_name = kt_desc = None
@@ -585,7 +594,7 @@ async def reembed_all_pages_task(ctx: dict, job_id: str) -> None:
     from app.ai.embedding_catalog import get_spec
     from app.ai.registry import ProviderRegistry
     from app.database import async_session_factory
-    from app.database.models import EmbeddingJob, WikiPage
+    from app.database.models import EmbeddingJob, SourceChunk, WikiPage
     from app.services.config_service import (
         ACTIVE_EMBEDDING_MODEL_KEY,
         ConfigService,
@@ -595,6 +604,11 @@ async def reembed_all_pages_task(ctx: dict, job_id: str) -> None:
         compute_content_hash,
         embedding_input_text,
         upsert_page_embedding,
+    )
+    from app.services.source_chunk_service import (
+        chunk_embedding_input,
+        cleanup_stale_chunk_embeddings,
+        upsert_chunk_embedding,
     )
 
     job_uuid = uuid.UUID(job_id)
@@ -632,14 +646,17 @@ async def reembed_all_pages_task(ctx: dict, job_id: str) -> None:
             return
 
         # Count work and mark running.
-        total = (
+        page_ids = (
             await session.execute(
                 select(WikiPage.id).where(
                     WikiPage.slug.notin_(["_index", "_log"])
                 )
             )
         ).scalars().all()
-        job.total_pages = len(total)
+        chunk_ids = (
+            await session.execute(select(SourceChunk.id))
+        ).scalars().all()
+        job.total_pages = len(page_ids) + len(chunk_ids)
         job.done_pages = 0
         job.status = "running"
         job.started_at = datetime.now(timezone.utc)
@@ -647,12 +664,13 @@ async def reembed_all_pages_task(ctx: dict, job_id: str) -> None:
 
     logger.info(
         f"reembed: starting job {job_id} model={spec.id} dim={spec.dimension} "
-        f"total={len(total)}"
+        f"pages={len(page_ids)} chunks={len(chunk_ids)}"
     )
 
     # Process batches in independent sessions so progress is visible to UI poll.
-    for offset in range(0, len(total), BATCH):
-        batch_ids = total[offset : offset + BATCH]
+    done = 0
+    for offset in range(0, len(page_ids), BATCH):
+        batch_ids = page_ids[offset : offset + BATCH]
         async with async_session_factory() as session:
             # Re-check cancellation flag.
             job = await session.get(EmbeddingJob, job_uuid)
@@ -689,7 +707,44 @@ async def reembed_all_pages_task(ctx: dict, job_id: str) -> None:
                         page.title, page.summary or "", page.content_md or ""
                     ),
                 )
-            job.done_pages = min(offset + len(pages), job.total_pages)
+            done += len(pages)
+            job.done_pages = min(done, job.total_pages)
+            await session.commit()
+
+    for offset in range(0, len(chunk_ids), BATCH):
+        batch_ids = chunk_ids[offset : offset + BATCH]
+        async with async_session_factory() as session:
+            job = await session.get(EmbeddingJob, job_uuid)
+            if job is None or job.status == "cancelled":
+                logger.info(f"reembed: job {job_id} cancelled during chunks offset={offset}")
+                return
+
+            chunks = (
+                await session.execute(
+                    select(SourceChunk).where(SourceChunk.id.in_(batch_ids))
+                )
+            ).scalars().all()
+            inputs = [chunk_embedding_input(chunk) for chunk in chunks]
+            try:
+                vectors = await provider.embed_batch(inputs)
+            except Exception as e:
+                job.status = "failed"
+                job.error_message = f"Chunk embedding API failed: {e}"
+                job.finished_at = datetime.now(timezone.utc)
+                await session.commit()
+                logger.exception(f"reembed: chunk job {job_id} failed at offset={offset}")
+                return
+
+            for chunk, vec in zip(chunks, vectors):
+                await upsert_chunk_embedding(
+                    session,
+                    chunk_id=chunk.id,
+                    spec=spec,
+                    vector=list(vec),
+                    content_hash=chunk.content_hash,
+                )
+            done += len(chunks)
+            job.done_pages = min(done, job.total_pages)
             await session.commit()
 
     # Atomic flip + cleanup of old model's vectors.
@@ -700,12 +755,13 @@ async def reembed_all_pages_task(ctx: dict, job_id: str) -> None:
         svc = ConfigService(session)
         await svc.set(ACTIVE_EMBEDDING_MODEL_KEY, spec.id)
         deleted = await cleanup_stale_embeddings(session, keep_spec_id=spec.id)
+        deleted_chunks = await cleanup_stale_chunk_embeddings(session, keep_spec_id=spec.id)
         job.status = "completed"
         job.finished_at = datetime.now(timezone.utc)
         await session.commit()
         logger.info(
             f"reembed: job {job_id} complete — flipped to {spec.id}, "
-            f"cleaned up {deleted} stale embedding rows"
+            f"cleaned up {deleted} stale wiki rows and {deleted_chunks} stale chunk rows"
         )
 
 
