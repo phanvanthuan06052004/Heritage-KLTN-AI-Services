@@ -185,6 +185,34 @@ class SourceImage(Base):
     source: Mapped["Source"] = relationship()
 
 
+class SourceChunk(Base):
+    """Searchable raw-text chunk derived from a Source page/section."""
+    __tablename__ = "source_chunks"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sources.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    page_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    metadata_: Mapped[Optional[dict]] = mapped_column("metadata", JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("source_id", "chunk_index", name="uq_source_chunks_source_idx"),
+        Index("ix_source_chunks_source_page", "source_id", "page_number"),
+    )
+
+    source: Mapped["Source"] = relationship()
+
+
 # ---------------------------------------------------------------------------
 # Wiki — LLM-compiled persistent knowledge layer
 # ---------------------------------------------------------------------------
@@ -837,6 +865,64 @@ def get_embedding_model_for_dim(dimension: int) -> type:
         ) from e
 
 
+# ---------------------------------------------------------------------------
+# Multi-dimension raw source chunk embeddings
+# ---------------------------------------------------------------------------
+
+class _SourceChunkEmbeddingBase:
+    """Mixin: shared columns for all source_chunk_embeddings_<dim> tables."""
+
+    chunk_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("source_chunks.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    model_spec_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    embedded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class SourceChunkEmbedding768(_SourceChunkEmbeddingBase, Base):
+    __tablename__ = "source_chunk_embeddings_768"
+    embedding = mapped_column(Vector(768), nullable=False)
+
+
+class SourceChunkEmbedding1024(_SourceChunkEmbeddingBase, Base):
+    __tablename__ = "source_chunk_embeddings_1024"
+    embedding = mapped_column(Vector(1024), nullable=False)
+
+
+class SourceChunkEmbedding1536(_SourceChunkEmbeddingBase, Base):
+    __tablename__ = "source_chunk_embeddings_1536"
+    embedding = mapped_column(Vector(1536), nullable=False)
+
+
+class SourceChunkEmbedding3072(_SourceChunkEmbeddingBase, Base):
+    __tablename__ = "source_chunk_embeddings_3072"
+    embedding = mapped_column(HALFVEC(3072), nullable=False)
+
+
+_SOURCE_CHUNK_EMBEDDING_MODEL_BY_DIM: dict[int, type] = {
+    768: SourceChunkEmbedding768,
+    1024: SourceChunkEmbedding1024,
+    1536: SourceChunkEmbedding1536,
+    3072: SourceChunkEmbedding3072,
+}
+
+
+def get_source_chunk_embedding_model_for_dim(dimension: int) -> type:
+    """Return the SourceChunkEmbedding<dim> ORM class for a supported dimension."""
+    try:
+        return _SOURCE_CHUNK_EMBEDDING_MODEL_BY_DIM[dimension]
+    except KeyError as e:
+        raise ValueError(
+            f"Unsupported source chunk embedding dimension: {dimension}. "
+            f"Supported: {sorted(_SOURCE_CHUNK_EMBEDDING_MODEL_BY_DIM)}"
+        ) from e
+
+
 class EmbeddingJob(Base):
     """Tracks a background re-embed job triggered when admin switches model."""
 
@@ -924,4 +1010,3 @@ class SkillContribution(Base):
         Index("ix_skill_contributions_contributor_id", "contributor_id"),
         Index("ix_skill_contributions_status", "status"),
     )
-
