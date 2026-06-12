@@ -213,6 +213,128 @@ class QueryResponse(BaseModel):
     rawSources: list[QueryRawSource] = []
 
 
+# --- Heritage CMS -> wiki sync (single source of truth: Heritage-LastDance-BE) ---
+
+class HeritageSyncRequest(BaseModel):
+    """One published heritage item pushed from the Heritage CMS (Neon DB).
+
+    The AI service mirrors it into a wiki page so the chatbot answers stay in
+    sync with the CMS. Keyed by `slug` — re-sending the same slug updates in
+    place (idempotent upsert).
+    """
+
+    heritageId: str
+    slug: str
+    title: str
+    summary: Optional[str] = None
+    content: Optional[str] = None
+    type: Optional[str] = None
+    history: Optional[str] = None
+    architecture: Optional[str] = None
+    culturalSignificance: Optional[str] = None
+    constructionPeriod: Optional[str] = None
+    founder: Optional[str] = None
+    legends: Optional[str] = None
+    alternativeNames: list[str] = []
+    address: Optional[str] = None
+    province: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    sourceUrl: Optional[str] = None
+
+
+class HeritageSyncResponse(BaseModel):
+    heritageId: str
+    wikiSlug: str
+    status: str  # "created" | "updated"
+    embedded: bool
+
+
+class HeritageSyncDeleteResponse(BaseModel):
+    wikiSlug: str
+    deleted: bool
+
+
+# Wiki pages mirrored from the CMS are namespaced + tagged so they never collide
+# with manually-authored wiki pages and can be filtered by the chatbot.
+HERITAGE_WIKI_PREFIX = "di-tich-"
+HERITAGE_KNOWLEDGE_SLUG = "di-tich"
+
+
+def heritage_wiki_slug(heritage_slug: str) -> str:
+    return f"{HERITAGE_WIKI_PREFIX}{heritage_slug.strip().strip('/')}"
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_ENTITIES = {
+    "&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">",
+    "&quot;": '"', "&#39;": "'", "&apos;": "'",
+}
+
+
+def _strip_html(text: Optional[str]) -> str:
+    """Convert CMS rich-text (HTML) to plain text for clean embeddings/answers."""
+    if not text:
+        return ""
+    # Block tags -> newlines so paragraphs/lists stay readable.
+    out = re.sub(r"</(p|div|li|h[1-6]|tr|br)\s*>", "\n", text, flags=re.IGNORECASE)
+    out = re.sub(r"<br\s*/?>", "\n", out, flags=re.IGNORECASE)
+    out = re.sub(r"<li[^>]*>", "- ", out, flags=re.IGNORECASE)
+    out = _HTML_TAG_RE.sub("", out)
+    for ent, ch in _HTML_ENTITIES.items():
+        out = out.replace(ent, ch)
+    # Collapse excess blank lines / trailing spaces.
+    out = re.sub(r"[ \t]+\n", "\n", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+def _build_heritage_markdown(req: "HeritageSyncRequest") -> tuple[str, str]:
+    """Compose (summary, content_md) markdown from a structured heritage item."""
+    summary = _strip_html(req.summary)
+    parts: list[str] = [f"# {req.title}"]
+
+    meta: list[str] = []
+    if req.type:
+        meta.append(f"- **Loại di sản:** {req.type}")
+    if req.constructionPeriod:
+        meta.append(f"- **Thời kỳ xây dựng:** {req.constructionPeriod}")
+    if req.founder:
+        meta.append(f"- **Người sáng lập / xây dựng:** {req.founder}")
+    loc = ", ".join([p for p in (req.address, req.province) if p])
+    if loc:
+        meta.append(f"- **Địa điểm:** {loc}")
+    if req.alternativeNames:
+        meta.append(f"- **Tên gọi khác:** {', '.join(req.alternativeNames)}")
+    if meta:
+        parts.append("\n".join(meta))
+
+    if summary:
+        parts.append(f"## Giới thiệu\n{summary}")
+
+    sections = [
+        ("Nội dung", req.content),
+        ("Lịch sử", req.history),
+        ("Kiến trúc", req.architecture),
+        ("Giá trị văn hóa", req.culturalSignificance),
+        ("Truyền thuyết", req.legends),
+    ]
+    for heading, body in sections:
+        body = _strip_html(body)
+        if body:
+            parts.append(f"## {heading}\n{body}")
+
+    if req.sourceUrl:
+        parts.append(f"---\nNguồn: {req.sourceUrl}")
+
+    content_md = "\n\n".join(parts).strip()
+    # Fallback summary if the CMS item had none.
+    if not summary:
+        summary = _strip_html(req.content) or _strip_html(req.history) or req.title
+        summary = summary[:280]
+    return summary, content_md
+
+
 # ---------------------------------------------------------------------------
 # Retrieval + generation helpers
 # ---------------------------------------------------------------------------
@@ -821,3 +943,84 @@ async def heritage_source_progress(
         page_count=len(source.page_offsets or []),
         wiki_page_count=wiki_count,
     )
+
+
+@router.post("/sync", response_model=HeritageSyncResponse, summary="Mirror a published heritage item into the wiki knowledge base")
+async def heritage_sync(
+    req: HeritageSyncRequest,
+    db: AsyncSession = Depends(get_db),
+    _token: str = Depends(get_service_token),
+):
+    """
+    Upsert a single published heritage item (from Heritage-LastDance-BE / Neon)
+    into a global wiki page, keyed by slug, then re-embed it.
+
+    This keeps the chatbot's knowledge in sync with the CMS — calling it again
+    with the same slug updates the page in place. The page is namespaced
+    (`di-tich-<slug>`) and tagged (`di-tich`) so it never collides with
+    manually-authored wiki content.
+    """
+    from app.services import wiki_service
+
+    wiki_slug = heritage_wiki_slug(req.slug)
+    summary, content_md = _build_heritage_markdown(req)
+
+    existing = await wiki_service.get_page_by_slug(db, wiki_slug)
+    status = "updated" if existing is not None else "created"
+
+    await wiki_service.upsert_page(
+        db,
+        slug=wiki_slug,
+        title=req.title,
+        page_type="entity",
+        content_md=content_md,
+        summary=summary,
+        knowledge_type_slugs=[HERITAGE_KNOWLEDGE_SLUG],
+        source_ids=[],
+    )
+
+    # Re-embed so semantic search picks it up. Fail-soft: a missing/unconfigured
+    # embedding model must not fail the sync (full-text search still works).
+    embedded = False
+    try:
+        from app.ai.registry import ProviderRegistry
+        from app.ai.wiki_compiler import _reembed_pages
+
+        provider = await ProviderRegistry(db).get_embedding(task="document")
+        await _reembed_pages(db, provider, [wiki_slug])
+        embedded = True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[Heritage sync] embed skipped for {wiki_slug}: {e}")
+
+    await db.commit()
+    logger.info(f"[Heritage sync] {status} wiki page '{wiki_slug}' (embedded={embedded})")
+    return HeritageSyncResponse(
+        heritageId=req.heritageId,
+        wikiSlug=wiki_slug,
+        status=status,
+        embedded=embedded,
+    )
+
+
+@router.delete("/sync/{slug:path}", response_model=HeritageSyncDeleteResponse, summary="Remove a heritage item from the wiki knowledge base")
+async def heritage_sync_delete(
+    slug: str,
+    db: AsyncSession = Depends(get_db),
+    _token: str = Depends(get_service_token),
+):
+    """
+    Remove a heritage item's mirrored wiki page (when it is unpublished or
+    deleted in the CMS). `slug` is the original heritage slug — the namespace
+    prefix is applied here. Idempotent: returns deleted=False if not present.
+    """
+    from app.services import wiki_service
+
+    wiki_slug = heritage_wiki_slug(slug)
+    existing = await wiki_service.get_page_by_slug(db, wiki_slug)
+    if existing is None:
+        return HeritageSyncDeleteResponse(wikiSlug=wiki_slug, deleted=False)
+
+    await wiki_service.delete_page_cascade(db, wiki_slug)
+    await db.commit()
+    logger.info(f"[Heritage sync] deleted wiki page '{wiki_slug}'")
+    return HeritageSyncDeleteResponse(wikiSlug=wiki_slug, deleted=True)
