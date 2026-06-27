@@ -22,11 +22,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # ---------------------------------------------------------------------------
 
 async def _get_identity():
-    """Resolve the bearer token to a ResolvedIdentity, or return an error string."""
-    from fastmcp.server.dependencies import get_http_request
+    """Resolve the bearer token to a ResolvedIdentity or PublicUserIdentity.
 
-    from app.database import async_session_factory
-    from app.services.mcp_auth_service import MCPAuthService
+    Supports two token types:
+      - usr_xxx  → public end-user, verified via NestJS BE
+      - other    → internal employee, verified via local DB (legacy)
+    """
+    from fastmcp.server.dependencies import get_http_request
 
     try:
         request = get_http_request()
@@ -37,10 +39,23 @@ async def _get_identity():
 
     if not token:
         return None, (
-            "Authentication required. Configure your MCP token in Claude Desktop:\n"
+            "Authentication required. Configure your MCP token:\n"
             '{"mcpServers": {"heritage-ai": {"url": "...", '
             '"headers": {"Authorization": "Bearer <your-token>"}}}}'
         )
+
+    # --- Public user token (usr_ prefix) ---
+    if token.startswith("usr_"):
+        from app.services.public_user_auth import verify_public_user_token
+
+        identity = await verify_public_user_token(token)
+        if identity is None:
+            return None, "Invalid or expired MCP token. Please generate a new one from your Heritage profile."
+        return identity, None
+
+    # --- Legacy employee token (ark_ or other prefix) ---
+    from app.database import async_session_factory
+    from app.services.mcp_auth_service import MCPAuthService
 
     async with async_session_factory() as session:
         auth_svc = MCPAuthService(session)
@@ -50,6 +65,7 @@ async def _get_identity():
         await session.commit()
 
     return identity, None
+
 
 
 async def _get_allowed_source_ids(identity, session: Optional[AsyncSession] = None) -> Optional[set[str]]:
@@ -666,6 +682,9 @@ def register_tools(mcp: FastMCP):
             return err
         assert identity is not None
 
+        if not hasattr(identity, "employee_id"):
+            return "This tool is only available for staff/editor accounts."
+
         if not slug or not content_md.strip():
             return "Error: slug and content_md are required."
         if slug in ("_index", "_log"):
@@ -732,6 +751,9 @@ def register_tools(mcp: FastMCP):
             return err
         assert identity is not None
 
+        if not hasattr(identity, "employee_id"):
+            return "This tool is only available for staff/editor accounts."
+
         if not slug or not content_md.strip():
             return "Error: slug and content_md are required."
         if slug in ("_index", "_log"):
@@ -788,6 +810,9 @@ def register_tools(mcp: FastMCP):
         if err:
             return err
         assert identity is not None
+
+        if not hasattr(identity, "employee_id"):
+            return "This tool is only available for staff/editor accounts."
 
         async with async_session_factory() as session:
             employee = await session.get(Employee, identity.employee_id)
@@ -859,6 +884,9 @@ def register_tools(mcp: FastMCP):
         if err:
             return err
         assert identity is not None
+
+        if not hasattr(identity, "employee_id"):
+            return "This tool is only available for staff/editor accounts."
 
         try:
             did = _uuid.UUID(draft_id)
@@ -934,6 +962,9 @@ def register_tools(mcp: FastMCP):
             return err
         assert identity is not None
 
+        if not hasattr(identity, "employee_id"):
+            return "This tool is only available for staff/editor accounts."
+
         try:
             did = _uuid.UUID(draft_id)
         except ValueError:
@@ -994,6 +1025,9 @@ def register_tools(mcp: FastMCP):
             return err
         assert identity is not None
 
+        if not hasattr(identity, "employee_id"):
+            return "This tool is only available for staff/editor accounts."
+
         if not reviewer_note or not reviewer_note.strip():
             return "Error: reviewer_note is required when rejecting a draft."
 
@@ -1028,3 +1062,170 @@ def register_tools(mcp: FastMCP):
             await session.commit()
 
         return f"Draft `{draft_id}` rejected. Note to author: {reviewer_note}"
+
+    # =========================================================================
+    # Personal tools — for public end-users (usr_ tokens)
+    # Data fetched from Heritage NestJS BE on behalf of the authenticated user.
+    # userId is NEVER accepted as a parameter — always derived from token.
+    # =========================================================================
+
+    @mcp.tool()
+    async def get_my_trips(limit: int = 10) -> str:
+        """
+        Get your recorded heritage travel journeys.
+
+        Returns your trips including route distance, duration, calories,
+        and heritage sites visited along the way.
+
+        Args:
+            limit: Maximum number of trips to return (default: 10, max: 50).
+        """
+        identity, err = await _get_identity()
+        if err:
+            return err
+
+        from app.services.public_user_auth import PublicUserIdentity
+        if not isinstance(identity, PublicUserIdentity):
+            return "This tool is for personal accounts. Use the Heritage web app for trip data."
+
+        limit = min(max(1, limit), 50)
+        data = await _fetch_nestjs_user_data(f"/api/trips/user/{identity.user_id}")
+        if data is None:
+            return "Could not retrieve your trips. The Heritage service may be temporarily unavailable."
+
+        trips = data if isinstance(data, list) else data.get("data", [])
+        if not trips:
+            return "You haven't recorded any heritage journeys yet. Start exploring Vietnamese heritage sites and record your trips!"
+
+        trips = trips[:limit]
+        lines = [f"**Your Heritage Journeys — {len(trips)} trip(s)**\n"]
+        for t in trips:
+            title = t.get("title", "Untitled trip")
+            distance_km = round((t.get("distanceM", 0) or 0) / 1000, 1)
+            duration_min = round((t.get("durationSec", 0) or 0) / 60)
+            kcal = t.get("kcal") or 0
+            heritage_count = t.get("heritageCount", 0) or 0
+            date = (t.get("startedAt") or t.get("createdAt", ""))[:10]
+
+            line = f"- **{title}** ({date})"
+            line += f"\n  📏 {distance_km} km · ⏱ {duration_min} min · 🔥 {kcal} kcal"
+            if heritage_count:
+                line += f" · 🏛 {heritage_count} heritage site(s)"
+
+            heritages = t.get("heritages", [])
+            if heritages:
+                names = ", ".join(h.get("name", "?") for h in heritages[:5])
+                line += f"\n  Sites: {names}"
+            lines.append(line)
+
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def get_my_favorites() -> str:
+        """
+        Get your saved/favorited heritage sites.
+
+        Returns a list of Vietnamese heritage sites you have bookmarked.
+        """
+        identity, err = await _get_identity()
+        if err:
+            return err
+
+        from app.services.public_user_auth import PublicUserIdentity
+        if not isinstance(identity, PublicUserIdentity):
+            return "This tool is for personal accounts."
+
+        data = await _fetch_nestjs_user_data(f"/api/favorites/user/{identity.user_id}")
+        if data is None:
+            return "Could not retrieve your favorites. The Heritage service may be temporarily unavailable."
+
+        items = data.get("items", []) if isinstance(data, dict) else data
+        if not items:
+            return "You haven't saved any heritage sites yet. Browse Vietnamese heritage sites and add them to your favorites!"
+
+        lines = [f"**Your Favorite Heritage Sites — {len(items)} saved**\n"]
+        for item in items:
+            title = item.get("title", "Unknown heritage")
+            slug = item.get("slug", "")
+            added_at = (item.get("favoriteAddedAt") or "")[:10]
+            line = f"- **{title}**"
+            if slug:
+                line += f" (slug: `{slug}`)"
+            if added_at:
+                line += f" — saved {added_at}"
+            lines.append(line)
+
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def get_my_passport_stats() -> str:
+        """
+        Get your Heritage Passport statistics — XP, level, check-ins, and badges.
+
+        The Heritage Passport is a gamification feature that tracks your
+        visits to Vietnamese cultural heritage sites.
+        """
+        identity, err = await _get_identity()
+        if err:
+            return err
+
+        from app.services.public_user_auth import PublicUserIdentity
+        if not isinstance(identity, PublicUserIdentity):
+            return "This tool is for personal accounts."
+
+        data = await _fetch_nestjs_user_data(f"/api/gamification/progress/{identity.user_id}")
+        if data is None:
+            return "Could not retrieve your passport stats. The Heritage service may be temporarily unavailable."
+
+        profile = data.get("data", data) if isinstance(data, dict) else data
+
+        xp = profile.get("xp", 0)
+        level = profile.get("level", 1)
+        check_in_count = profile.get("totalCheckIns", 0)
+        streak = profile.get("streakCount", 0)
+
+        lines = [
+            f"**Your Heritage Passport**\n",
+            f"- 🎯 **Level:** {level}",
+            f"- ⭐ **XP:** {xp:,}",
+            f"- 📍 **Check-ins:** {check_in_count}",
+            f"- 🔥 **Current streak:** {streak} day(s)",
+        ]
+
+        badges = profile.get("badges", [])
+        if badges:
+            badge_names = ", ".join(b.get("name", "?") for b in badges[:10])
+            lines.append(f"- 🏅 **Badges:** {badge_names}")
+
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper: fetch data from NestJS BE on behalf of a public user
+# ---------------------------------------------------------------------------
+
+async def _fetch_nestjs_user_data(path: str):
+    """Call Heritage NestJS BE internal API and return parsed JSON data."""
+    import httpx
+
+    from app.config import settings
+
+    nestjs_url = settings.heritage_be_url.rstrip("/")
+    service_token = settings.heritage_service_token
+
+    if not service_token:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(
+                f"{nestjs_url}{path}",
+                headers={"x-service-token": service_token},
+            )
+            if resp.status_code != 200:
+                return None
+            body = resp.json()
+            return body.get("data", body)
+    except Exception:
+        return None
+
