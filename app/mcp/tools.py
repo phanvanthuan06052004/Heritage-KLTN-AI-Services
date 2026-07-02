@@ -51,6 +51,45 @@ async def _get_identity():
         identity = await verify_public_user_token(token)
         if identity is None:
             return None, "Invalid or expired MCP token. Please generate a new one from your Heritage profile."
+
+        # Dynamic scope verification based on call stack
+        import inspect
+        scope_mapping = {
+            "search_wiki": "heritage:read",
+            "read_wiki_index": "heritage:read",
+            "read_wiki_page": "heritage:read",
+            "list_wiki_pages": "heritage:read",
+            "get_source": "heritage:read",
+            "get_source_outline": "heritage:read",
+            "get_source_pages": "heritage:read",
+            "list_sources": "heritage:read",
+            "list_knowledge_types": "heritage:read",
+            "get_knowledge_type_docs": "heritage:read",
+            
+            "get_my_trips": "user:read",
+            "get_my_favorites": "user:read",
+            "get_my_passport_stats": "user:read",
+            
+            "propose_wiki_edit": "wiki:write",
+            "edit_wiki_page": "wiki:write",
+            "list_pending_drafts": "wiki:write",
+            "review_draft": "wiki:write",
+            "approve_draft": "wiki:write",
+            "reject_draft": "wiki:write",
+        }
+        
+        required_scope = None
+        for frame in inspect.stack():
+            func_name = frame.function
+            if func_name in scope_mapping:
+                required_scope = scope_mapping[func_name]
+                break
+
+        if required_scope:
+            scopes = getattr(identity, "scopes", None)
+            if not scopes or required_scope not in scopes:
+                return None, f"Access denied: this tool requires the '{required_scope}' scope. Please update your MCP token configuration."
+
         return identity, None
 
     # --- Legacy employee token (ark_ or other prefix) ---

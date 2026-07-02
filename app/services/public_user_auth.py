@@ -35,6 +35,7 @@ class PublicUserIdentity:
     allowed_knowledge_types: Optional[list[str]] = None  # None = public only
     allowed_source_ids: Optional[list[str]] = None
     project_source_ids: list[str] = field(default_factory=list)
+    scopes: list[str] = field(default_factory=list)
 
 
 # In-memory cache: token -> (identity, expiry_time)
@@ -86,6 +87,7 @@ async def verify_public_user_token(token: str) -> Optional[PublicUserIdentity]:
                 email=user_data.get("email"),
                 name=user_data.get("name"),
                 avatar=user_data.get("avatar"),
+                scopes=user_data.get("scopes") or [],
             )
 
             # Cache the result
