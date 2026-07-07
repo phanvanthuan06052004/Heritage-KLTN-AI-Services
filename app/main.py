@@ -14,7 +14,7 @@ from app.mcp.server import create_mcp_server
 
 # Create the MCP server and its HTTP app (lifespan must be composed with FastAPI)
 mcp_server = create_mcp_server()
-mcp_http_app = mcp_server.http_app(path="/", stateless_http=True)
+mcp_http_app = mcp_server.http_app(path="/", stateless_http=True, host_origin_protection=False)
 
 
 async def seed_default_admin():
