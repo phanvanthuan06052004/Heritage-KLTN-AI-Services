@@ -2,10 +2,10 @@ import os
 import sys
 import paramiko
 
-SERVER = "180.93.43.7"
-PORT = 22
-USER = "root"
-PASSWORD = "@Sieutoc!dVCvasYDzZS"
+SERVER = os.environ.get("DEPLOY_SERVER", "")
+PORT = int(os.environ.get("DEPLOY_PORT", "22"))
+USER = os.environ.get("DEPLOY_USER", "")
+PASSWORD = os.environ.get("DEPLOY_PASSWORD", "")
 REMOTE_DIR = "/heritage-stag/AI-CHATBOX"
 COMPOSE_FILE = "docker-compose.yml"
 SERVICE = "heritage_ai_api"
@@ -196,16 +196,6 @@ def status():
         d.close()
 
 
-def ssh():
-    d = Deployer()
-    try:
-        d.connect()
-        print(f"\n=== SSH to {SERVER} ===")
-        d.run("bash -i", desc="Starting interactive shell")
-    finally:
-        d.close()
-
-
 ACTIONS = {
     "sync": sync,
     "build": build,
@@ -217,7 +207,6 @@ ACTIONS = {
     "logs-api": logs_api,
     "logs-worker": logs_worker,
     "status": status,
-    "ssh": ssh,
 }
 
 if __name__ == "__main__":
